@@ -838,37 +838,33 @@ def _pwl_get_payload(ctx, session, ssl_verification_enabled):
     return body["response"]
 
 
-def _pwl_initialize_pre_authn(ctx, session, ssl_verification_enabled):
-    # The SPA calls /pre_authn/initialization first to establish the server-side
-    # auth session; /auth/payload returns HTTP 400 if this is skipped.
-    response = session.get(
-        _pwl_url(ctx, "/pre_authn/initialization"),
-        verify=ssl_verification_enabled,
-        headers=_pwl_headers(ctx),
-        params={"authkey": ctx["authkey"], "is_ipad": "false"},
-    )
-    trace_http_request(response)
-    _pwl_check_ok(response, "initializing the Duo pre-authentication session")
+def _pwl_resolve_payload(ctx, session, ssl_verification_enabled):
+    # /auth/payload gates factors behind device-health collection a headless
+    # client cannot perform, so read them from /pre_authn/evaluation when the
+    # payload itself carries none.
+    payload = _pwl_get_payload(ctx, session, ssl_verification_enabled)
+    if _pwl_factors(payload):
+        return payload
+    return _pwl_evaluate_pre_authn(ctx, session, ssl_verification_enabled)
 
 
 def _pwl_evaluate_pre_authn(ctx, session, ssl_verification_enabled):
-    # Best-effort: the SPA performs a pre-auth risk evaluation before offering
-    # factors. It is not required to trigger a push, so failures are ignored.
-    try:
-        response = session.get(
-            _pwl_url(ctx, "/pre_authn/evaluation"),
-            verify=ssl_verification_enabled,
-            headers=_pwl_headers(ctx),
-            params={
-                "authkey": ctx["authkey"],
-                "browser_features": _PWL_BROWSER_FEATURES,
-                "local_trust_choice": "undecided",
-            },
-        )
-        trace_http_request(response)
-        logging.debug("pwl pre_authn/evaluation response: {}".format(response.text))
-    except Exception as e:
-        logging.info("pwl pre_authn/evaluation failed (continuing): {}".format(e))
+    # The evaluation response embeds the available factors under
+    # auth_factors_context; return it for factor/device selection.
+    response = session.get(
+        _pwl_url(ctx, "/pre_authn/evaluation"),
+        verify=ssl_verification_enabled,
+        headers=_pwl_headers(ctx),
+        params={
+            "authkey": ctx["authkey"],
+            "browser_features": _PWL_BROWSER_FEATURES,
+            "local_trust_choice": "undecided",
+        },
+    )
+    trace_http_request(response)
+    body = _pwl_check_ok(response, "evaluating Duo pre-authentication")
+    logging.debug("pwl pre_authn/evaluation response: {}".format(json.dumps(body.get("response"))))
+    return body["response"]
 
 
 # Async pwl factors share a POST -> poll -> finalize shape; only the
@@ -909,9 +905,7 @@ def _pwl_perform_authentication_transaction(ctx, factor, device, session, ssl_ve
             type=str,
         )
 
-    _pwl_initialize_pre_authn(ctx, session, ssl_verification_enabled)
-    _pwl_evaluate_pre_authn(ctx, session, ssl_verification_enabled)
-    payload = _pwl_get_payload(ctx, session, ssl_verification_enabled)
+    payload = _pwl_resolve_payload(ctx, session, ssl_verification_enabled)
 
     if factor in _PWL_ASYNC_FACTORS:
         return _pwl_authenticate_async(ctx, factor, payload, device, session, ssl_verification_enabled)
